@@ -1,81 +1,102 @@
 from __future__ import annotations
 
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List
 
-import pandas as pd
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from openpyxl import load_workbook
+
 
 EXCEL_PATH = "Data_Lib.xlsx"
 SHEET_NAME = "api"
 
 app = FastAPI(title="Library Locator API", version="1.0.0")
 
-# เปิด CORS ไว้ก่อน (Jotform มักเรียกจาก client/webhook ได้หลายแบบ)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ปรับให้เข้มงวดทีหลังได้
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-_df: Optional[pd.DataFrame] = None
+_rows: Optional[List[Dict[str, Any]]] = None
 
 
-def load_data() -> pd.DataFrame:
-    """Load once and keep in memory."""
-    global _df
-    if _df is not None:
-        return _df
+def to_float(x) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-    df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME)
 
-    # ทำความสะอาดชนิดข้อมูลที่จำเป็น
-    num_cols = ["range_start_num", "range_end_num", "row", "shelf_level", "locker", "building_floor"]
-    for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+def to_int(x) -> Optional[int]:
+    if x is None:
+        return None
+    try:
+        return int(float(x))
+    except Exception:
+        return None
 
-    # เติม suffix ให้เป็น string ว่างแทน NaN
-    for c in ["range_start_suffix", "range_end_suffix"]:
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str).str.strip()
 
-    # เติมข้อความอื่น ๆ
-    for c in ["id", "side", "category", "call_range", "map_url", "range_start_raw", "range_end_raw"]:
-        if c in df.columns:
-            df[c] = df[c].fillna("").astype(str).str.strip()
+def load_data() -> List[Dict[str, Any]]:
+    global _rows
+    if _rows is not None:
+        return _rows
 
-    # ตัดแถวที่ตัวเลขช่วงไม่ครบ
-    df = df.dropna(subset=["range_start_num", "range_end_num"]).copy()
+    wb = load_workbook(EXCEL_PATH, read_only=True, data_only=True)
+    ws = wb[SHEET_NAME]
 
-    _df = df
-    return _df
+    # header row
+    headers = []
+    for cell in next(ws.iter_rows(min_row=1, max_row=1, values_only=True)):
+        headers.append(str(cell).strip() if cell is not None else "")
+
+    rows: List[Dict[str, Any]] = []
+    for r in ws.iter_rows(min_row=2, values_only=True):
+        d = {}
+        for k, v in zip(headers, r):
+            if not k:
+                continue
+            d[k] = v
+
+        # normalize expected fields
+        d["range_start_num"] = to_float(d.get("range_start_num"))
+        d["range_end_num"] = to_float(d.get("range_end_num"))
+        d["row"] = to_int(d.get("row"))
+        d["shelf_level"] = to_int(d.get("shelf_level"))
+        d["locker"] = to_int(d.get("locker"))
+        d["building_floor"] = to_int(d.get("building_floor"))
+
+        # strings
+        for c in ["id", "side", "category", "call_range", "map_url", "range_start_raw", "range_end_raw", "range_start_suffix", "range_end_suffix"]:
+            if c in d and d[c] is not None:
+                d[c] = str(d[c]).strip()
+            else:
+                d[c] = ""
+
+        # keep only rows with numeric range
+        if d["range_start_num"] is None or d["range_end_num"] is None:
+            continue
+
+        rows.append(d)
+
+    wb.close()
+    _rows = rows
+    return _rows
 
 
 THAI_SUFFIX_RE = re.compile(r"(?P<num>[0-9.]+)\s*(?P<suffix>[ก-๙]{0,3})$", re.UNICODE)
 
 
 def normalize_call_number(raw: str) -> tuple[Optional[float], str]:
-    """
-    รับอินพุตได้เช่น:
-      - "370.113"
-      - "370113"
-      - "370.113พ"
-      - "370113พ"
-      - "370.1ศ."
-    คืนค่า: (num_float, suffix_str)
-    """
     if not raw:
         return None, ""
 
-    s = str(raw).strip()
-    # ลบช่องว่าง/ขีด/จุดท้าย ๆ ที่เป็น noise
-    s = s.replace("–", "-").replace("—", "-")
-    s = s.strip()
-
+    s = str(raw).strip().replace("–", "-").replace("—", "-")
     m = THAI_SUFFIX_RE.search(s)
     if not m:
         return None, ""
@@ -83,48 +104,26 @@ def normalize_call_number(raw: str) -> tuple[Optional[float], str]:
     num_part = m.group("num").strip()
     suffix = (m.group("suffix") or "").strip()
 
-    # ถ้า num_part ไม่มีจุด ให้พยายามใส่จุดหลัง 3 หลักแรก
-    # ตัวอย่าง: 370113 -> 370.113, 3701 -> 370.1
     if "." not in num_part:
         digits = re.sub(r"\D", "", num_part)
         if len(digits) <= 3:
-            # เช่น "370" -> 370.0
             try:
-                return float(digits), suffix
+                return round(float(digits), 3), suffix
             except Exception:
                 return None, suffix
-        else:
-            # ใส่จุดหลัง 3 หลักแรก
-            num_part = digits[:3] + "." + digits[3:]
+        num_part = digits[:3] + "." + digits[3:]
 
     try:
-        num = float(num_part)
+        num = round(float(num_part), 3)
     except Exception:
         return None, suffix
 
-    # ปัด 3 ตำแหน่งให้ใกล้เคียงข้อมูลในไฟล์ (ที่มี 3 decimals)
-    num = round(num, 3)
     return num, suffix
 
 
-def suffix_ge(a: str, b: str) -> bool:
-    """a >= b สำหรับ suffix ไทย (ใช้ unicode order)"""
-    return a >= b
-
-
-def suffix_le(a: str, b: str) -> bool:
-    """a <= b สำหรับ suffix ไทย (ใช้ unicode order)"""
-    return a <= b
-
-
-def match_row(row: pd.Series, q_num: float, q_suffix: str, strict_suffix: bool) -> bool:
-    """
-    strict_suffix:
-      - True  = ถ้าผู้ใช้พิมพ์ suffix มา ให้เช็คขอบเขต suffix ตอนเลขเท่ากับขอบช่วง
-      - False = ถ้าผู้ใช้ไม่พิมพ์ suffix มา จะใช้เฉพาะเลข (inclusive) ไม่สน suffix
-    """
-    start_n = row["range_start_num"]
-    end_n = row["range_end_num"]
+def match_row(d: Dict[str, Any], q_num: float, q_suffix: str, strict_suffix: bool) -> bool:
+    start_n = d["range_start_num"]
+    end_n = d["range_end_num"]
 
     if q_num < start_n or q_num > end_n:
         return False
@@ -132,39 +131,34 @@ def match_row(row: pd.Series, q_num: float, q_suffix: str, strict_suffix: bool) 
     if not strict_suffix:
         return True
 
-    # ถ้าเลขอยู่กลางช่วง (ไม่ชนขอบ) ก็ผ่าน
     if q_num > start_n and q_num < end_n:
         return True
 
-    # ถ้าเลขชนขอบ ให้พิจารณา suffix
-    start_s = row.get("range_start_suffix", "") or ""
-    end_s = row.get("range_end_suffix", "") or ""
+    start_s = d.get("range_start_suffix", "") or ""
+    end_s = d.get("range_end_suffix", "") or ""
 
-    # ชนขอบต้น
     if q_num == start_n and start_s:
-        if not suffix_ge(q_suffix, start_s):
+        if q_suffix < start_s:
             return False
 
-    # ชนขอบท้าย
     if q_num == end_n and end_s:
-        if not suffix_le(q_suffix, end_s):
+        if q_suffix > end_s:
             return False
 
     return True
 
 
-def rank_candidates(df: pd.DataFrame, q_num: float) -> pd.DataFrame:
-    """จัดอันดับให้ช่วงแคบกว่าอยู่ก่อน (ช่วยลดความกำกวม)"""
-    d = df.copy()
-    d["span"] = (d["range_end_num"] - d["range_start_num"]).abs()
-    d = d.sort_values(["span", "row", "shelf_level", "locker"], ascending=[True, True, True, True])
-    return d
+def rank_candidates(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def span(d):
+        return abs((d["range_end_num"] or 0) - (d["range_start_num"] or 0))
+
+    return sorted(items, key=lambda d: (span(d), d.get("row") or 10**9, d.get("shelf_level") or 10**9, d.get("locker") or 10**9))
 
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    df = load_data()
-    return {"ok": True, "rows": int(df.shape[0])}
+    data = load_data()
+    return {"ok": True, "rows": len(data)}
 
 
 @app.get("/search")
@@ -172,59 +166,49 @@ def search(
     q: str = Query(..., description="เลขหมวดหรือคำค้น เช่น 370.113พ หรือ 370113 หรือ สังคมศาสตร์"),
     limit: int = Query(5, ge=1, le=20),
 ) -> Dict[str, Any]:
-    df = load_data()
-
+    data = load_data()
     q = (q or "").strip()
 
-    # 1) พยายามตีความเป็น call number ก่อน
     q_num, q_suffix = normalize_call_number(q)
 
+    # 1) call number search
     if q_num is not None:
-        strict_suffix = bool(q_suffix)  # ถ้ามี suffix ค่อย strict
-        mask = df.apply(lambda r: match_row(r, q_num, q_suffix, strict_suffix), axis=1)
-        hits = df[mask].copy()
+        strict_suffix = bool(q_suffix)
+        hits = [d for d in data if match_row(d, q_num, q_suffix, strict_suffix)]
 
-        if hits.empty:
+        if not hits:
             return {
                 "found": False,
                 "mode": "call_number",
                 "query": q,
                 "normalized": {"num": q_num, "suffix": q_suffix},
                 "results": [],
-                "suggest": [
-                    "ลองพิมพ์เฉพาะตัวเลข เช่น 370.113 หรือ 370113",
-                    "ถ้ามีตัวอักษรท้ายเลข ลองใส่ด้วย เช่น 370.113พ",
-                    "หรือค้นด้วยคำหมวด เช่น สังคมศาสตร์",
-                ],
             }
 
-        hits = rank_candidates(hits, q_num).head(limit)
-
+        hits = rank_candidates(hits)[:limit]
         results = []
-        for _, r in hits.iterrows():
-            results.append(
-                {
-                    "id": r.get("id", ""),
-                    "call_range": r.get("call_range", ""),
-                    "category": r.get("category", ""),
-                    "location": {
-                        "row": int(r.get("row", 0)) if pd.notna(r.get("row", None)) else None,
-                        "shelf_level": int(r.get("shelf_level", 0)) if pd.notna(r.get("shelf_level", None)) else None,
-                        "locker": int(r.get("locker", 0)) if pd.notna(r.get("locker", None)) else None,
-                        "building_floor": int(r.get("building_floor", 0)) if pd.notna(r.get("building_floor", None)) else None,
-                        "side": r.get("side", ""),
-                    },
-                    "range": {
-                        "start_raw": r.get("range_start_raw", ""),
-                        "end_raw": r.get("range_end_raw", ""),
-                        "start_num": float(r.get("range_start_num", 0.0)),
-                        "end_num": float(r.get("range_end_num", 0.0)),
-                        "start_suffix": r.get("range_start_suffix", ""),
-                        "end_suffix": r.get("range_end_suffix", ""),
-                    },
-                    "map_url": r.get("map_url", ""),
-                }
-            )
+        for d in hits:
+            results.append({
+                "id": d.get("id", ""),
+                "call_range": d.get("call_range", ""),
+                "category": d.get("category", ""),
+                "location": {
+                    "row": d.get("row"),
+                    "shelf_level": d.get("shelf_level"),
+                    "locker": d.get("locker"),
+                    "building_floor": d.get("building_floor"),
+                    "side": d.get("side", ""),
+                },
+                "range": {
+                    "start_raw": d.get("range_start_raw", ""),
+                    "end_raw": d.get("range_end_raw", ""),
+                    "start_num": d.get("range_start_num"),
+                    "end_num": d.get("range_end_num"),
+                    "start_suffix": d.get("range_start_suffix", ""),
+                    "end_suffix": d.get("range_end_suffix", ""),
+                },
+                "map_url": d.get("map_url", ""),
+            })
 
         return {
             "found": True,
@@ -235,50 +219,29 @@ def search(
             "results": results,
         }
 
-    # 2) ถ้าไม่ใช่เลขหมวด ให้ค้นแบบข้อความ (category / call_range / id)
+    # 2) text search
     q_low = q.lower()
-    text_mask = (
-        df["category"].str.lower().str.contains(q_low, na=False)
-        | df["call_range"].str.lower().str.contains(q_low, na=False)
-        | df["id"].str.lower().str.contains(q_low, na=False)
-    )
-    hits = df[text_mask].copy()
+    def s(x): return (x or "").lower()
 
-    if hits.empty:
-        return {
-            "found": False,
-            "mode": "text",
-            "query": q,
-            "results": [],
-            "suggest": [
-                "ลองค้นด้วยเลขหมวด เช่น 370.113 หรือ 370113",
-                "หรือค้นด้วยคำหมวด เช่น สังคมศาสตร์ / วิทยาศาสตร์",
-            ],
-        }
+    hits = [d for d in data if (q_low in s(d.get("category")) or q_low in s(d.get("call_range")) or q_low in s(d.get("id")))]
+    if not hits:
+        return {"found": False, "mode": "text", "query": q, "results": []}
 
-    hits = hits.head(limit)
+    hits = hits[:limit]
     results = []
-    for _, r in hits.iterrows():
-        results.append(
-            {
-                "id": r.get("id", ""),
-                "call_range": r.get("call_range", ""),
-                "category": r.get("category", ""),
-                "location": {
-                    "row": int(r.get("row", 0)) if pd.notna(r.get("row", None)) else None,
-                    "shelf_level": int(r.get("shelf_level", 0)) if pd.notna(r.get("shelf_level", None)) else None,
-                    "locker": int(r.get("locker", 0)) if pd.notna(r.get("locker", None)) else None,
-                    "building_floor": int(r.get("building_floor", 0)) if pd.notna(r.get("building_floor", None)) else None,
-                    "side": r.get("side", ""),
-                },
-                "map_url": r.get("map_url", ""),
-            }
-        )
+    for d in hits:
+        results.append({
+            "id": d.get("id", ""),
+            "call_range": d.get("call_range", ""),
+            "category": d.get("category", ""),
+            "location": {
+                "row": d.get("row"),
+                "shelf_level": d.get("shelf_level"),
+                "locker": d.get("locker"),
+                "building_floor": d.get("building_floor"),
+                "side": d.get("side", ""),
+            },
+            "map_url": d.get("map_url", ""),
+        })
 
-    return {
-        "found": True,
-        "mode": "text",
-        "query": q,
-        "count": len(results),
-        "results": results,
-    }
+    return {"found": True, "mode": "text", "query": q, "count": len(results), "results": results}
